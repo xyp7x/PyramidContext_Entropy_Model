@@ -1,5 +1,14 @@
 # PyramidContext_Entropy_Model
 
+
+## Installation
+
+- Detectron2 
+    https://github.com/facebookresearch/detectron2
+
+- CompressAI 
+    https://github.com/InterDigitalInc/CompressAI
+
 ## Folder Structure
 ```
 bitstream/...
@@ -8,7 +17,7 @@ compressai/
     ...
     compressai/...
     ...
-    
+
 dataset/...
 
 detectron2/
