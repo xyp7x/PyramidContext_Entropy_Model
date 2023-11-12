@@ -10,7 +10,7 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models.google import MeanScaleHyperprior
 
 from compressai.layers import (
-    GDN, 
+    GDN,
     MaskedConv2d,
     AttentionBlock,
     ResidualBlock,
@@ -27,19 +27,51 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
         N (int): Number of channels
     """
 
-    def __init__(self, N=192,M=192, **kwargs):
-        super().__init__(N=N, **kwargs)
+    def __init__(self, N=192, M=192, **kwargs):
+        super().__init__(N=N, M=M, **kwargs)
 
-        self.g_a = nn.Sequential(
-            ResidualBlockWithStride(256, N, stride=2),
-            ResidualBlock(N, N),
-            ResidualBlockWithStride(N, N, stride=2),
-            AttentionBlock(N),
-            ResidualBlock(N, N),
-            ResidualBlockWithStride(N, N, stride=2),
-            ResidualBlock(N, N),
-            conv3x3(N, N, stride=2),
-            AttentionBlock(N),
+        # self.g_a = nn.Sequential(
+        #     ResidualBlockWithStride(256, N, stride=2),
+        #     ResidualBlock(N, N),
+        #     ResidualBlockWithStride(N, N, stride=2),
+        #     AttentionBlock(N),
+        #     ResidualBlock(N, N),
+        #     ResidualBlockWithStride(N, N, stride=2),
+        #     ResidualBlock(N, N),
+        #     conv3x3(N, N, stride=2),
+        #     AttentionBlock(N),
+        # )
+
+        channels_plyr = [256, 256, 256, 256]
+
+        self.g_a_plyr = nn.ModuleDict(
+            {
+                "p2": nn.Sequential(
+                    ResidualBlockWithStride(channels_plyr[0], N, stride=2),
+                    ResidualBlock(N, N),
+                    ResidualBlockWithStride(N, N, stride=2),
+                    ResidualBlock(N, N // 2),
+                    conv3x3(N // 2, N // 4, stride=2),
+                    AttentionBlock(N // 4),
+                ),
+                "p3": nn.Sequential(
+                    ResidualBlockWithStride(channels_plyr[1], N, stride=2),
+                    ResidualBlock(N, N // 2),
+                    conv3x3(N // 2, N // 4, stride=2),
+                    AttentionBlock(N // 4),
+                ),
+                "p4": nn.Sequential(
+                    ResidualBlockWithStride(channels_plyr[2], N, stride=2),
+                    ResidualBlock(N, N // 2),
+                    conv3x3(N // 2, N // 4),
+                    AttentionBlock(N // 4),
+                ),
+                "p5": nn.Sequential(
+                    ResidualBlock(channels_plyr[3], N // 2),
+                    conv3x3(N // 2, N // 4),
+                    AttentionBlock(N // 4),
+                ),
+            }
         )
 
         self.h_a = nn.Sequential(
@@ -66,18 +98,49 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
             conv3x3(N * 3 // 2, N * 2),
         )
 
-        self.g_s = nn.Sequential(
-            AttentionBlock(N),
-            ResidualBlock(N, N),
-            ResidualBlockUpsample(N, N, 2),
-            ResidualBlock(N, N),
-            ResidualBlockUpsample(N, N, 2),
-            AttentionBlock(N),
-            ResidualBlock(N, N),
-            ResidualBlockUpsample(N, N, 2),
-            ResidualBlock(N, N),
-            subpel_conv3x3(N, 256, 2),
+        # self.g_s = nn.Sequential(
+        #     AttentionBlock(N),
+        #     ResidualBlock(N, N),
+        #     ResidualBlockUpsample(N, N, 2),
+        #     ResidualBlock(N, N),
+        #     ResidualBlockUpsample(N, N, 2),
+        #     AttentionBlock(N),
+        #     ResidualBlock(N, N),
+        #     ResidualBlockUpsample(N, N, 2),
+        #     ResidualBlock(N, N),
+        #     subpel_conv3x3(N, 256, 2),
+        # )
+
+
+        self.g_s_plyr = nn.ModuleDict(
+            {
+                "p2": nn.Sequential(
+                    AttentionBlock(N),
+                    ResidualBlockUpsample(N, N, 2),
+                    ResidualBlock(N, N),
+                    ResidualBlockUpsample(N, N, 2),
+                    ResidualBlock(N, N),
+                    subpel_conv3x3(N, 256, 2),
+                    
+                ),
+                "p3": nn.Sequential(
+                    AttentionBlock(N),
+                    ResidualBlockUpsample(N, N, 2),
+                    ResidualBlock(N, N),
+                    subpel_conv3x3(N, 256, 2),
+                ),
+                "p4": nn.Sequential(
+                    AttentionBlock(N),
+                    ResidualBlockUpsample(N, N, 2),
+                    ResidualBlock(N, 256),
+                ),
+                "p5": nn.Sequential(
+                    AttentionBlock(N),
+                    ResidualBlock(N, 256),
+                ),
+            }
         )
+
 
         self.entropy_parameters = nn.Sequential(
             nn.Conv2d(M * 12 // 3, M * 10 // 3, 1),
@@ -87,14 +150,11 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
             nn.Conv2d(M * 8 // 3, M * 6 // 3, 1),
         )
 
-        self.context_prediction = MaskedConv2d(
-            M, 2 * M, kernel_size=5, padding=2, stride=1
-        )
+        self.context_prediction = MaskedConv2d(M, 2 * M, kernel_size=5, padding=2, stride=1)
 
         self.gaussian_conditional = GaussianConditional(None)
         self.N = int(N)
         self.M = int(M)
-
 
     @classmethod
     def from_state_dict(cls, state_dict):
@@ -104,33 +164,40 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
         net = cls(N, M)
         net.load_state_dict(state_dict)
         return net
-    
+
     @property
     def downsampling_factor(self) -> int:
         return 2 ** (4 + 2)
 
     def forward(self, x):
-        y = self.g_a(x)
+
+        y_plyr = {}
+        for layer_name, feature in x.items():
+            y_plyr[layer_name] = self.g_a_plyr[layer_name](feature)
+        y = torch.cat(list(y_plyr.values()), axis=1)
+
+        # y = self.g_a(x)
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
         params = self.h_s(z_hat)
 
-        y_hat = self.gaussian_conditional.quantize(
-            y, "noise" if self.training else "dequantize"
-        )
+        y_hat = self.gaussian_conditional.quantize(y, "noise" if self.training else "dequantize")
         ctx_params = self.context_prediction(y_hat)
-        gaussian_params = self.entropy_parameters(
-            torch.cat((params, ctx_params), dim=1)
-        )
+        gaussian_params = self.entropy_parameters(torch.cat((params, ctx_params), dim=1))
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         _, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
-        x_hat = self.g_s(y_hat)
+
+
+        x_hat={}
+        for layer_name, g_a_s in self.g_s_plyr.items():
+            x_hat[layer_name] = g_a_s(y_hat)
+
+        #x_hat = self.g_s(y_hat)
 
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
-
 
     def compress(self, x):
         if next(self.parameters()).device != torch.device("cpu"):
@@ -208,9 +275,7 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
                 symbols_list.extend(y_q.squeeze().tolist())
                 indexes_list.extend(indexes.squeeze().tolist())
 
-        encoder.encode_with_indexes(
-            symbols_list, indexes_list, cdf, cdf_lengths, offsets
-        )
+        encoder.encode_with_indexes(symbols_list, indexes_list, cdf, cdf_lengths, offsets)
 
         string = encoder.flush()
         return string
@@ -260,9 +325,7 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
         x_hat = self.g_s(y_hat).clamp_(0, 1)
         return {"x_hat": x_hat}
 
-    def _decompress_ar(
-        self, y_string, y_hat, params, height, width, kernel_size, padding
-    ):
+    def _decompress_ar(self, y_string, y_hat, params, height, width, kernel_size, padding):
         cdf = self.gaussian_conditional.quantized_cdf.tolist()
         cdf_lengths = self.gaussian_conditional.cdf_length.tolist()
         offsets = self.gaussian_conditional.offset.tolist()
@@ -290,9 +353,7 @@ class PyramidContext_PLYR(MeanScaleHyperprior):
                 scales_hat, means_hat = gaussian_params.chunk(2, 1)
 
                 indexes = self.gaussian_conditional.build_indexes(scales_hat)
-                rv = decoder.decode_stream(
-                    indexes.squeeze().tolist(), cdf, cdf_lengths, offsets
-                )
+                rv = decoder.decode_stream(indexes.squeeze().tolist(), cdf, cdf_lengths, offsets)
                 rv = torch.Tensor(rv).reshape(1, -1, 1, 1)
                 rv = self.gaussian_conditional.dequantize(rv, means_hat)
 

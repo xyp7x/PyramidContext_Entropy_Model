@@ -31,7 +31,7 @@ import os
 import sys 
 
 current_dir=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(current_dir)
+#sys.path.append(current_dir)
 
 from pathlib import Path
 import pickle
@@ -88,7 +88,7 @@ class FeaturesFromImg_SingleLayer(Dataset):
         split (string): split mode ('train' or 'val')
     """
 
-    def __init__(self, root, transform=None, split="train", data_split=1, patch_size=128, task_extractor='opimg_det',model_pretrained_path='./detectron2/pretrained_models'):
+    def __init__(self, root, transform=None, split="train", data_split=1, patch_size=128, task_extractor='opimg_det',model_pretrained_path='./detectron2/pretrained_models', device='cuda'):
         splitdir = os.path.join(root, split)
 
         if not os.path.isdir(splitdir):
@@ -117,6 +117,7 @@ class FeaturesFromImg_SingleLayer(Dataset):
         cfg = get_cfg()
         cfg.merge_from_file(model_zoo.get_config_file(model_cfg_name_extractor))
         cfg.MODEL.WEIGHTS = model_pretrained_path_extractor
+        cfg.MODEL.DEVICE=device
         self.extractor = PlayerPredictor(cfg)
 
     def __getitem__(self, index):
@@ -172,6 +173,87 @@ class FeaturesFromImg_SingleLayer(Dataset):
 
     def __len__(self):
         return len(self.samples)//self.data_split
+
+
+
+class FeaturesFromImg_PLYR(Dataset):
+    """Load feature maps from an image folder database. Training and testing image samples
+    are respectively stored in separate directories:
+
+    .. code-block::
+
+        - rootdir/
+            - train/
+                - img000.png
+                - img001.png
+            - test/
+                - img000.png
+                - img001.png
+
+    Args:
+        root (string): root directory of the dataset
+        transform (callable, optional): a function or transform that takes in a
+            PIL image and returns a transformed version
+        split (string): split mode ('train' or 'val')
+    """
+
+    def __init__(self, root, transform=None, split="train", data_split=1, patch_size=128, task_extractor='opimg_det',model_pretrained_path='./detectron2/pretrained_models', device='cuda'):
+        splitdir = os.path.join(root, split)
+
+        if not os.path.isdir(splitdir):
+            raise RuntimeError(f'Invalid directory "{splitdir}"')
+
+
+        self.samples = [os.path.join(splitdir,f) for f in os.listdir(splitdir) if os.path.isfile(os.path.join(splitdir,f))]
+        self.split = split
+        self.transform = transform
+        self.data_split =data_split
+        self.patch_size = patch_size
+
+        # load the model of extractor
+        if task_extractor == 'opimg_det':
+            model_cfg_name_extractor = "COCO-Detection/faster_rcnn_X_101_32x8d_FPN_3x.yaml"
+            model_pretrained_path_extractor=os.path.join(model_pretrained_path,'model_final_68b088.pkl')
+        elif task_extractor == 'opimg_seg':
+            model_cfg_name_extractor = "COCO-InstanceSegmentation/mask_rcnn_X_101_32x8d_FPN_3x.yaml"
+            model_pretrained_path_extractor=os.path.join(model_pretrained_path,'model_final_2d9806.pkl')
+        else:
+            assert False, print("Unrecognized task:", task_extractor)
+            
+        print('extractor', task_extractor, os.path.basename(model_cfg_name_extractor), os.path.basename(model_pretrained_path_extractor)) 
+        
+        # initialize model in detectron2
+        cfg = get_cfg()
+        cfg.merge_from_file(model_zoo.get_config_file(model_cfg_name_extractor))
+        cfg.MODEL.WEIGHTS = model_pretrained_path_extractor
+        cfg.MODEL.DEVICE=device
+        self.extractor = PlayerPredictor(cfg)
+
+    def __getitem__(self, index):
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            features: ``.
+        """
+
+        # read image
+        img = cv2.imread(str(self.samples[index]))
+        img = self.transform(torch.from_numpy(img.transpose(2,0,1)))
+        
+        # extract Player feature
+        features = self.extractor(img.numpy().transpose(1,2,0), save_player=True)
+        feature_names = ['p2', 'p3', 'p4', 'p5']
+        features.pop('p6')
+        for feature_name in feature_names:
+            features[feature_name] = features[feature_name].squeeze(0).cpu()
+   
+        return features
+
+    def __len__(self):
+        return len(self.samples)//self.data_split
+
 
 
 
