@@ -364,20 +364,18 @@ def main(argv):
         random.seed(17)  
 
     train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size)]
-    )
-
+        [transforms.RandomCrop(size=args.patch_size,pad_if_needed=True,fill=0,padding_mode='constant')])
+    
     test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size)]
-    )
+        [transforms.RandomCrop(size=args.patch_size,pad_if_needed=True,fill=0,padding_mode='constant')])
 
-    assert args.task_extractor+'_test' == args.test_dataset
-
-    # initialize the dataloader of features
-    train_dataset =dataloader_types[args.dataloader_type](args.dataset, transform=train_transforms, split=args.train_dataset,  data_split=5, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path)
-    test_dataset = dataloader_types[args.dataloader_type](args.dataset, transform=test_transforms, split=args.test_dataset, data_split=1, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path)
+    #assert args.task_extractor+'_test' == args.test_dataset
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+
+    # initialize the dataloader of features
+    train_dataset =dataloader_types[args.dataloader_type](args.dataset, transform=train_transforms, split=args.train_dataset,  data_split=5, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path,device=device)
+    test_dataset = dataloader_types[args.dataloader_type](args.dataset, transform=test_transforms, split=args.test_dataset, data_split=1, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path,device=device)
 
     train_dataloader = DataLoader(
         train_dataset,

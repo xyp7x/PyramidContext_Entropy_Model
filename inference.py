@@ -53,7 +53,7 @@ from utils import oid_mask_encoding
 from utils.codec import filesize, write_body, read_body, write_uints, read_uints
 from utils.feature_dump import FeatureDump
 
-from models.sa_entropy_model import JointAutoregressiveHierarchicalPriors_Channel256
+from models.baseline_channel256 import JointAutoregressiveHierarchicalPriors_Channel256
 
 
 # add model

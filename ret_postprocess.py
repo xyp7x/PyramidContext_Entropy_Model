@@ -12,7 +12,7 @@ def merge_multi_output(pre_results_folder):
     file_list = os.listdir(pre_results_folder)
     file_list.sort()
     for file in file_list:
-        if ('output' in file) and ('lambda' in file):
+        if ('_output_' in file):
             print(file)
             output_list.append(file)
     output_list.sort()

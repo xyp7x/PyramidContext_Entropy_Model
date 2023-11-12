@@ -32,9 +32,10 @@ import random
 import shutil
 import sys
 import time
+import math
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 current_dir=os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -47,19 +48,24 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from compressai.losses import RateDistortionLoss
 from compressai.optimizers import net_aux_optimizer
 from compressai.zoo import image_models
 
-from models.sa_entropy_model import JointAutoregressiveHierarchicalPriors_Channel256
-from dataset.dataset_feature import FeaturesFromImg_SingleLayer
+from pytorch_msssim import ms_ssim
+
+from models.baseline_channel256 import JointAutoregressiveHierarchicalPriors_Channel256, Cheng2020Attention_Channel256
+from models.cross_scale_model import CrossScale_PLYR
+from dataset.dataset_feature import FeaturesFromImg_SingleLayer, FeaturesFromImg_PLYR
 
 
 # add model and dataloader
 model_feature_compression = {}
 model_feature_compression['JointAutoregressiveHierarchicalPriors_Channel256'] = JointAutoregressiveHierarchicalPriors_Channel256
+model_feature_compression['Cheng2020Attention_Channel256'] = Cheng2020Attention_Channel256
+model_feature_compression['CrossScale_PLYR'] = CrossScale_PLYR
 dataloader_types = {}
 dataloader_types['FeaturesFromImg_SingleLayer'] = FeaturesFromImg_SingleLayer
+dataloader_types['FeaturesFromImg_PLYR'] = FeaturesFromImg_PLYR
 
 quality_lambda_dict = {0: 0.0009, 
                        1: 0.0018, 
@@ -101,6 +107,46 @@ class CustomDataParallel(nn.DataParallel):
         except AttributeError:
             return getattr(self.module, key)
 
+
+class RateDistortionLoss_PLYR(nn.Module):
+    """Custom rate distortion loss with a Lagrangian parameter."""
+
+    def __init__(self, lmbda=0.01, metric="mse", return_type="all"):
+        super().__init__()
+        if metric == "mse":
+            self.metric = nn.MSELoss()
+        elif metric == "ms-ssim":
+            self.metric = ms_ssim
+        else:
+            raise NotImplementedError(f"{metric} is not implemented!")
+        self.lmbda = lmbda
+        self.return_type = return_type
+
+    def forward(self, output, target):
+        N, _, H, W = target['p2'].size()
+        out = {}
+        num_pixels = N * H * W * 4
+
+        out["mse_loss"]=0
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+        if self.metric == ms_ssim:
+            out["ms_ssim_loss"] = self.metric(output["x_hat"], target, data_range=1)
+            distortion = 1 - out["ms_ssim_loss"]
+        else:
+            for k in target.keys():
+                out["mse_loss"] += self.metric(output["x_hat"][k], target[k])
+            distortion = 255**2 * out["mse_loss"]
+
+        out["loss"] = self.lmbda * distortion + out["bpp_loss"]
+        if self.return_type == "all":
+            return out
+        else:
+            return out[self.return_type]
+
+
 def findCheckPoint(modelFolder):
     if not os.path.exists(modelFolder):
         return -1
@@ -126,19 +172,100 @@ def configure_optimizers(net, args):
     return optimizer["net"], optimizer["aux"]
 
 
+def extend(x, base_num=16):
+    _, _, h, w = x.size()
+    ex_h = 0
+    ex_w = 0
+    out = x
+    if h % base_num != 0:
+        ex_h = base_num - h % base_num
+    if w % base_num != 0:
+        ex_w = base_num - w % base_num
+    out = nn.functional.pad(x, pad=(0, ex_w, 0, ex_h), mode="constant", value=0)
+    return out, ex_h, ex_w
+
+
+def BN4PLYR(ex_feas, feature_names=["p2", "p3", "p4", "p5"]):
+    # normalize the data in all scale by the same boundary value
+
+    ex_feas_normal = {}
+    max_s_batch = []
+    min_s_batch = []
+    for scale_i in feature_names:
+        max_s1 = torch.max(
+            torch.max(
+                torch.max(ex_feas[scale_i], dim=1, keepdim=True).values,
+                dim=2,
+                keepdim=True,
+            ).values,
+            dim=3,
+            keepdim=True,
+        ).values
+        min_s1 = torch.min(
+            torch.min(
+                torch.min(ex_feas[scale_i], dim=1, keepdim=True).values,
+                dim=2,
+                keepdim=True,
+            ).values,
+            dim=3,
+            keepdim=True,
+        ).values
+        max_s_batch.append(max_s1)
+        min_s_batch.append(min_s1)
+
+    max_s_batch = torch.cat(max_s_batch, 1)
+    min_s_batch = torch.cat(min_s_batch, 1)
+
+    max_s_batch = torch.max(max_s_batch, dim=1, keepdim=True).values
+    min_s_batch = torch.min(min_s_batch, dim=1, keepdim=True).values
+
+    max_s_batch = torch.ceil(max_s_batch)
+    min_s_batch = torch.floor(min_s_batch)
+
+    for scale_i in feature_names:
+        ex_feas_normal[scale_i]=(ex_feas[scale_i] - min_s_batch) / (max_s_batch - min_s_batch)
+        
+    return ex_feas_normal, max_s_batch, min_s_batch
+
+
+
 def train_one_epoch(
     model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, log_file
 ):
     model.train()
     device = next(model.parameters()).device
 
+    avg_loss = AverageMeter()
+    avg_bpp_loss = AverageMeter()
+    avg_mse_loss = AverageMeter()
+    avg_aux_loss = AverageMeter()
+
     for i, d in enumerate(train_dataloader):
-        d = d.to(device)
+       
+        #d = d.to(device)
+        
+        
+        _, ex_h_p5, ex_w_p5=extend(d['p5'])
+
+        hw_PLYR={}
+        d_ex={}
+        for layer_name, feature in d.items():
+            d[layer_name]=feature.to(device)
+            _, _, H, W=feature.shape
+            feature = nn.functional.pad(feature.to(device), pad=(0, (ex_w_p5+d['p5'].shape[3])*(2**(5-int(layer_name[-1])))-feature.shape[3], 0, (ex_h_p5+d['p5'].shape[2])*(2**(5-int(layer_name[-1])))-feature.shape[2]), mode="constant", value=0)
+            d_ex[layer_name]=feature
+            hw_PLYR[layer_name]=(H, W)
+            
+        d_ex, max_batch_norm, min_batch_norm=BN4PLYR(d_ex)
 
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        out_net = model(d)
+        out_net = model(d_ex)
+
+        for layer_name, feature in out_net['x_hat'].items():
+            feature = feature * (max_batch_norm - min_batch_norm) + min_batch_norm
+            out_net['x_hat'][layer_name]=feature[:,:, :hw_PLYR[layer_name][0], :hw_PLYR[layer_name][1]]
 
         out_criterion = criterion(out_net, d)
         out_criterion["loss"].backward()
@@ -150,7 +277,13 @@ def train_one_epoch(
         aux_loss.backward()
         aux_optimizer.step()
 
-        if i % 100 == 0:
+        avg_aux_loss.update(aux_loss.item())
+        avg_mse_loss.update(out_criterion["mse_loss"].item())
+        avg_bpp_loss.update(out_criterion["bpp_loss"].item())
+        avg_loss.update(out_criterion["loss"].item())
+        
+
+        if i % 500 == 0:
             content = time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time())) +\
                 f"Train epoch {epoch}: [" +\
                 f"{i*len(d)}/{len(train_dataloader.dataset)}" +\
@@ -161,6 +294,16 @@ def train_one_epoch(
                 f"\tAux loss: {aux_loss.item():.3f}"
             print(content)
             log_file.write(content+'\n')
+
+    content = time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time())) +\
+    f"Train epoch {epoch}: Average losses:" +\
+    f"\tLoss: {avg_loss.avg:.3f} |" +\
+    f"\tMSE loss: {avg_mse_loss.avg:.5f} |" +\
+    f"\tBpp loss: {avg_bpp_loss.avg:.3f} |" +\
+    f"\tAux loss: {avg_aux_loss.avg:.3f}\n"
+
+    print(content)
+    log_file.write(content + '\n')
 
 
 def test_epoch(epoch, test_dataloader, model, criterion, log_file):
@@ -174,9 +317,27 @@ def test_epoch(epoch, test_dataloader, model, criterion, log_file):
 
     with torch.no_grad():
         for d in test_dataloader:
-            d = d.to(device)
+            #d = d.to(device)
             
-            out_net = model(d)
+            _, ex_h_p5, ex_w_p5=extend(d['p5'])
+
+            hw_PLYR={}
+            d_ex={}
+            for layer_name, feature in d.items():
+                d[layer_name]=feature.to(device)
+                _, _, H, W=feature.shape
+                feature = nn.functional.pad(feature.to(device), pad=(0, (ex_w_p5+d['p5'].shape[3])*(2**(5-int(layer_name[-1])))-feature.shape[3], 0, (ex_h_p5+d['p5'].shape[2])*(2**(5-int(layer_name[-1])))-feature.shape[2]), mode="constant", value=0)
+                d_ex[layer_name]=feature
+                hw_PLYR[layer_name]=(H, W)
+                
+            d_ex, max_batch_norm, min_batch_norm=BN4PLYR(d_ex)
+
+            out_net = model(d_ex)
+
+            for layer_name, feature in out_net['x_hat'].items():
+                feature = feature * (max_batch_norm - min_batch_norm) + min_batch_norm
+                out_net['x_hat'][layer_name]=feature[:,:, :hw_PLYR[layer_name][0], :hw_PLYR[layer_name][1]]
+
             out_criterion = criterion(out_net, d)
 
             aux_loss.update(model.aux_loss())
@@ -215,20 +376,20 @@ def parse_args(argv):
     parser.add_argument(
         "-m",
         "--model",
-        default="JointAutoregressiveHierarchicalPriors_Channel256",
+        default="PyramidContext_PLYR",
         help="Model architecture (default: %(default)s)",
     )
     parser.add_argument(
         "-q",
         "--quality-level",
         type=int,
-        default=6,
+        default=10,
         help="Quality level (default: %(default)s)",
     )
     parser.add_argument(
         "--dataloader_type",
         type=str,
-        default='FeaturesFromImg_SingleLayer',
+        default='FeaturesFromImg_PLYR',
         help="dataloader type",
     )
     parser.add_argument(
@@ -286,8 +447,8 @@ def parse_args(argv):
     parser.add_argument(
         "--patch-size",
         type=int,
-        nargs=2,
-        default=(256, 256),
+        nargs=1,
+        default=768,
         help="Size of the patches to be cropped (default: %(default)s)",
     )
     parser.add_argument("--cuda", default=True, action="store_true", help="Use cuda")
@@ -326,7 +487,7 @@ def main(argv):
     if args.save:
         if not os.path.exists(args.save_location):
             os.mkdir(args.save_location)
-        save_location=os.path.join(args.save_location,args.task_extractor,str(args.lmbda))
+        save_location=os.path.join(args.save_location,args.task_extractor,args.model,str(args.lmbda))
         if not os.path.exists(save_location):
             os.makedirs(save_location)
 
@@ -342,20 +503,18 @@ def main(argv):
         random.seed(17)  
 
     train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size)]
-    )
-
+        [transforms.RandomCrop(size=args.patch_size,pad_if_needed=True,fill=0,padding_mode='constant')])
+    
     test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size)]
-    )
+        [transforms.RandomCrop(size=args.patch_size,pad_if_needed=True,fill=0,padding_mode='constant')])
 
-    assert args.task_extractor+'_test' == args.test_dataset
-
-    # initialize the dataloader of features
-    train_dataset =dataloader_types[args.dataloader_type](args.dataset, transform=train_transforms, split=args.train_dataset,  data_split=5, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path)
-    test_dataset = dataloader_types[args.dataloader_type](args.dataset, transform=test_transforms, split=args.test_dataset, data_split=1, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path)
+    #assert args.task_extractor+'_test' == args.test_dataset
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
+
+    # initialize the dataloader of features
+    train_dataset =dataloader_types[args.dataloader_type](args.dataset, transform=train_transforms, split=args.train_dataset,  data_split=5, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path,device=device)
+    test_dataset = dataloader_types[args.dataloader_type](args.dataset, transform=test_transforms, split=args.test_dataset, data_split=1, patch_size=args.patch_size,task_extractor=args.task_extractor,model_pretrained_path=args.model_pretrained_path,device=device)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -381,12 +540,12 @@ def main(argv):
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
-    criterion = RateDistortionLoss(lmbda=args.lmbda)
+    criterion = RateDistortionLoss_PLYR(lmbda=args.lmbda)
 
     last_epoch = 0
     if args.save_location:
         if os.path.exists(args.save_location):
-            save_location=os.path.join(args.save_location,args.task_extractor,str(args.lmbda))
+            save_location=os.path.join(args.save_location,args.task_extractor,args.model, str(args.lmbda))
             if os.path.exists(save_location):
                 last_epoch_temp, ckptName =  findCheckPoint(save_location)
                 print('%-30s%-20s' %('find latest model epoch',last_epoch_temp))
@@ -427,7 +586,7 @@ def main(argv):
             best_loss = min(loss, best_loss)
 
             if args.save:
-                model_path=os.path.join(save_location,f'DKIC_lambda{args.lmbda}_epoch{epoch}_checkpoint.pth.tar')
+                model_path=os.path.join(save_location,args.model+f'_lambda{args.lmbda}_epoch{epoch}_checkpoint.pth.tar')
                 save_checkpoint(
                     {
                         "epoch": epoch,

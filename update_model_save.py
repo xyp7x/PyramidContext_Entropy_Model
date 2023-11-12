@@ -35,7 +35,7 @@ current_dir=os.path.dirname(os.path.abspath(__file__))
 
 import torch
 import torch.nn as nn
-from models.sa_entropy_model import JointAutoregressiveHierarchicalPriors_Channel256
+from workspace.MM.FCM.PyramidContext_Entropy_Model.models.cross_scale_model import JointAutoregressiveHierarchicalPriors_Channel256
 
 
 if __name__ == "__main__":

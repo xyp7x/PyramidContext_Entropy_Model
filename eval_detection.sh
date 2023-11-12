@@ -7,12 +7,12 @@
 set -e
 
 # load configuration
-file_folder=$(realpath /home/dingding/workspace/MM/FCM/ScaleA_Entropy_Model/)
+file_folder=$(realpath /home/dingding/workspace/MM/FCM/PyramidContext_Entropy_Model/)
 dataset_dir=$(realpath /home/dingding/workspace/MM/Dataset/FCM/)
 
 # modified the path of predicted results
 pre_results_root_dir=$file_folder/ret_detection
-pre_result_dir=$pre_results_root_dir/ret_opimg_det_pretrained_model_50
+pre_result_dir=$pre_results_root_dir/ret_opimg_det_pretrained_model_100
 
 # load the file for evaluation
 anno_dir=$dataset_dir/annotations_5k
